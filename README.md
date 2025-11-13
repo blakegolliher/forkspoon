@@ -1,259 +1,145 @@
 # Forkspoon
 
-A high-performance FUSE filesystem that provides aggressive metadata caching for slow backend storage while maintaining passthrough data operations.
+A proof-of-concept FUSE filesystem that provides metadata caching for NFS mounts.
 
-[![Go Version](https://img.shields.io/badge/Go-1.21%2B-blue)](https://golang.org)
-[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Linux-lightgrey)](https://www.kernel.org/)
+## Overview
 
-## 🚀 Features
+Forkspoon is a POC implementation that demonstrates how to reduce metadata operations on NFS filesystems by implementing aggressive caching at the FUSE layer. It intercepts and caches metadata operations while passing through data operations directly to the backend.
 
-- **Aggressive Metadata Caching**: Reduces metadata operations by up to 90%
-- **Passthrough Data Operations**: Zero overhead for actual file content
-- **Configurable Cache TTL**: From seconds to hours based on your needs
-- **Comprehensive Metrics**: Transaction logging and performance statistics
-- **Production Ready**: systemd integration, monitoring, and health checks
-- **Transparent Operation**: Works with any backend filesystem
+## Purpose
 
-## 📊 Performance
-
-Typical performance improvements for metadata operations:
-
-| Backend | Operation | Direct | Cached | Speedup |
-|---------|-----------|--------|--------|---------|
-| NFS | `ls -la` | 500ms | 50ms | **10x** |
-| S3FS | `find .` | 30s | 2s | **15x** |
-| HDD | `stat` | 15ms | 1ms | **15x** |
-
-## 🎯 Use Cases
-
-- **Slow Network Filesystems**: NFS, CIFS, S3FS
-- **Development Environments**: Speed up builds and IDE operations
-- **CI/CD Pipelines**: Accelerate repeated file access patterns
-- **Home Directories**: Cache user profile data
-- **Archive Access**: Infrequently changing data
-
-## ⚡ Quick Start
-
-```bash
-# Install
-wget -qO- https://github.com/yourusername/forkspoon/releases/latest/download/install.sh | bash
-
-# Mount with 5-minute cache
-forkspoon \
-  -backend /mnt/slow-nfs \
-  -mountpoint /mnt/fast-cache \
-  -cache-ttl 5m
-
-# Access files through cache
-ls -la /mnt/fast-cache  # First access: Cache miss
-ls -la /mnt/fast-cache  # Second access: Instant (from cache)
-```
-
-## 📦 Installation
-
-### From Source
-
-```bash
-# Clone repository
-git clone https://github.com/yourusername/forkspoon.git
-cd forkspoon
-
-# Build
-make build
-
-# Install (optional)
-sudo make install
-```
-
-### Pre-built Binaries
-
-Download from [Releases](https://github.com/yourusername/forkspoon/releases)
-
-### Docker
-
-```bash
-docker run -v /source:/backend -v /cache:/mountpoint \
-  --privileged ghcr.io/yourusername/forkspoon
-```
-
-## 🔧 Configuration
-
-### Basic Options
-
-```bash
-forkspoon \
-  -backend /source \           # Required: Backend directory
-  -mountpoint /cache \          # Required: Mount point
-  -cache-ttl 5m \              # Cache timeout (default: 5m)
-  -verbose \                   # Enable verbose logging
-  -trans-log /var/log/tx.log \ # Transaction log
-  -stats-file stats.json       # Statistics output
-```
-
-### Cache TTL Guidelines
-
-| Use Case | Recommended TTL |
-|----------|-----------------|
-| Development | 30s - 1m |
-| Build Systems | 1m - 5m |
-| Production | 5m - 10m |
-| Archives | 30m - 1h |
-
-## 📈 Monitoring
-
-### Transaction Log
-
-```bash
-# View all operations
-tail -f /var/log/cache-fuse/transactions.log
-
-# Monitor cache misses
-grep CACHE_MISS /var/log/cache-fuse/transactions.log
-
-# Analyze patterns
-awk -F'|' '{print $2, $3}' transactions.log | sort | uniq -c
-```
-
-### Statistics
-
-```json
-{
-  "cache_ttl_seconds": 300,
-  "cached_operations": {
-    "getattr": {
-      "hits": 45230,
-      "misses": 1523,
-      "hit_rate": 96.7
-    },
-    "lookup": {
-      "hits": 23410,
-      "misses": 892,
-      "hit_rate": 96.3
-    }
-  },
-  "passthrough_operations": {
-    "read": 5234,
-    "write": 1023,
-    "create": 234
-  }
-}
-```
-
-## 🏗️ Architecture
-
-```
-┌──────────────┐
-│  Application │
-└──────┬───────┘
-       │
-┌──────▼────────────────────────┐
-│     Linux VFS (Page Cache)     │
-└──────┬────────────────────────┘
-       │
-┌──────▼────────────────────────┐
-│         FUSE Kernel Module      │
-└──────┬────────────────────────┘
-       │
-┌──────▼────────────────────────┐
-│       Forkspoon Daemon      │
-│  ┌─────────────┬─────────────┐ │
-│  │  Metadata   │    Data      │ │
-│  │  Caching    │ Passthrough  │ │
-│  └─────────────┴─────────────┘ │
-└──────┬────────────────────────┘
-       │
-┌──────▼────────────────────────┐
-│        Backend Filesystem       │
-└───────────────────────────────┘
-```
-
-### What Gets Cached
-
-✅ **Cached (via kernel VFS)**:
-- File attributes (size, permissions, timestamps)
+This project explores the feasibility of improving NFS performance for metadata-heavy workloads by caching:
+- File attributes (stat operations)
 - Directory entry lookups
 - Directory listings
 
-❌ **Not Cached (passthrough)**:
-- File contents (read/write)
-- File creation/deletion
-- File modifications
+Data operations (read/write) pass through directly to maintain data integrity.
 
-## 🧪 Testing
+## Requirements
 
-```bash
-# Run all tests
-make test
+- Linux kernel 3.15+ with FUSE support
+- Go 1.21+
+- FUSE libraries
+- An existing NFS mount to accelerate
 
-# Specific tests
-make test-cache      # Cache behavior
-make test-write      # Write operations
-make test-benchmark  # Performance comparison
-```
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-| Issue | Solution |
-|-------|----------|
-| Permission denied | Add `user_allow_other` to `/etc/fuse.conf` |
-| Transport endpoint not connected | `fusermount -u /mountpoint` and remount |
-| High memory usage | Reduce cache TTL or clear kernel cache |
-| Stale data | Reduce cache TTL for fresher data |
-
-### Debug Mode
+## Building from Source
 
 ```bash
-forkspoon \
-  -backend /source \
-  -mountpoint /cache \
-  -verbose \
-  -debug \
-  -trans-log debug.log
+# Clone repository
+git clone https://github.com/blakegolliher/forkspoon.git
+cd forkspoon
+
+# Build
+go mod download
+go build -o forkspoon ./cmd/forkspoon
+
+# Or use make
+make build
 ```
 
-## 🤝 Contributing
+## Usage
 
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-### Development Setup
+Basic usage to cache an NFS mount:
 
 ```bash
-# Clone with submodules
-git clone --recursive https://github.com/yourusername/forkspoon.git
+# Assume NFS is mounted at /mnt/nfs
+# Create a cache mount point
+mkdir /mnt/nfs-cached
 
-# Install development tools
-make dev-setup
+# Mount with 5-minute cache TTL
+./forkspoon \
+  -backend /mnt/nfs \
+  -mountpoint /mnt/nfs-cached \
+  -cache-ttl 5m
 
-# Run tests before committing
-make pre-commit
+# Access files through the cache mount
+ls -la /mnt/nfs-cached
 ```
 
-## 📝 License
+## Configuration Options
 
-MIT License - see [LICENSE](LICENSE) file for details.
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-backend` | required | Path to NFS mount |
+| `-mountpoint` | required | Where to mount cached filesystem |
+| `-cache-ttl` | 5m | Cache timeout duration |
+| `-verbose` | false | Enable verbose logging |
+| `-trans-log` | none | Transaction log file path |
+| `-stats-file` | none | Statistics output file |
 
-## 🌟 Acknowledgments
+## Testing
 
-- Built with [go-fuse](https://github.com/hanwen/go-fuse)
-- Inspired by various caching filesystem implementations
-- Thanks to all contributors!
+Run the test suite:
 
-## 📚 Documentation
+```bash
+# Quick functionality test
+./scripts/quick_test.sh
 
-- [Implementation Guide](IMPLEMENTATION_GUIDE.md) - Detailed setup and configuration
-- [Performance Tuning](docs/TUNING.md) - Optimization strategies
-- [API Reference](docs/API.md) - Programming interface
-- [Benchmarks](benchmarks/README.md) - Performance tests
+# Performance benchmark
+./scripts/benchmark.sh
 
-## 💬 Support
+# Cache behavior test
+./scripts/test_cache.sh
+```
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/forkspoon/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/forkspoon/discussions)
-- **Wiki**: [Project Wiki](https://github.com/yourusername/forkspoon/wiki)
+## How It Works
 
----
+1. Forkspoon mounts as a FUSE filesystem layered over your NFS mount
+2. Metadata operations are cached for the configured TTL
+3. The kernel serves cached metadata without calling our FUSE daemon
+4. After TTL expires, the next access refreshes the cache
+5. All data operations bypass the cache entirely
 
-**Star ⭐ this repo if you find it useful!**
+## Performance Expectations
+
+For NFS mounts, typical improvements for metadata operations:
+- Directory listings: 5-10x faster
+- File stat operations: 5-15x faster
+- Find operations: 10x+ faster
+
+Actual improvements depend on network latency to the NFS server.
+
+## Monitoring
+
+View cache behavior with transaction logging:
+
+```bash
+# Enable transaction log
+./forkspoon \
+  -backend /mnt/nfs \
+  -mountpoint /mnt/cached \
+  -trans-log /tmp/forkspoon.log \
+  -verbose
+
+# Monitor cache misses
+tail -f /tmp/forkspoon.log | grep CACHE_MISS
+```
+
+## Limitations
+
+- This is a proof-of-concept, not production software
+- No active cache invalidation (relies on TTL expiry)
+- Cache is lost on unmount
+- Changes made directly to the NFS mount won't be visible until cache expires
+
+## Architecture
+
+```
+Application
+    |
+Linux VFS (kernel cache)
+    |
+FUSE Kernel Module
+    |
+Forkspoon Daemon
+    |
+NFS Mount
+```
+
+## License
+
+MIT License - see LICENSE file
+
+## Status
+
+This is a proof-of-concept project for testing metadata caching strategies with NFS filesystems.

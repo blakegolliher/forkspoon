@@ -1,450 +1,209 @@
-# Implementation Guide - Metadata-Caching FUSE Filesystem
+# Forkspoon Implementation Guide
 
-## Table of Contents
-1. [Quick Start](#quick-start)
-2. [System Requirements](#system-requirements)
-3. [Installation](#installation)
-4. [Configuration](#configuration)
-5. [Testing](#testing)
-6. [Performance Tuning](#performance-tuning)
-7. [Monitoring](#monitoring)
-8. [Troubleshooting](#troubleshooting)
+## Overview
 
----
-
-## Quick Start
-
-```bash
-# Clone the repository
-git clone https://github.com/yourusername/forkspoon.git
-cd forkspoon
-
-# Install Go (if not installed)
-./scripts/install_go.sh
-
-# Build the filesystem
-make build
-
-# Run a quick test
-./scripts/quick_test.sh
-
-# Mount your filesystem
-./forkspoon \
-  -backend /mnt/slow-storage \
-  -mountpoint /mnt/fast-cache \
-  -cache-ttl 5m
-```
-
----
+Forkspoon is a proof-of-concept FUSE filesystem that caches metadata operations for NFS mounts while passing through data operations unchanged.
 
 ## System Requirements
 
-### Minimum Requirements
-- Linux kernel 3.15+ (FUSE support)
-- Go 1.19+ (1.21 recommended)
-- 512MB RAM
-- FUSE libraries installed
-
-### Recommended Setup
-- Linux kernel 5.4+
+- Linux kernel 3.15+ with FUSE support
 - Go 1.21+
-- 2GB+ RAM for large directory trees
-- SSD for transaction logs
+- FUSE development libraries
+- An existing NFS mount
 
 ### Installing Dependencies
 
-#### RHEL/CentOS/Rocky Linux
+RHEL/CentOS/Rocky Linux:
 ```bash
 sudo yum install -y fuse fuse-libs
 sudo yum groupinstall -y "Development Tools"
 ```
 
-#### Ubuntu/Debian
+Ubuntu/Debian:
 ```bash
 sudo apt-get update
 sudo apt-get install -y fuse libfuse-dev build-essential
 ```
 
-#### Enable FUSE for Non-root Users
+## Building
+
 ```bash
-# Add user to fuse group
-sudo usermod -a -G fuse $USER
-
-# Enable user_allow_other in fuse.conf
-echo "user_allow_other" | sudo tee -a /etc/fuse.conf
-
-# Logout and login for group changes to take effect
-```
-
----
-
-## Installation
-
-### Method 1: From Source
-```bash
-# Clone repository
-git clone https://github.com/yourusername/forkspoon.git
+# Clone and build
+git clone https://github.com/blakegolliher/forkspoon.git
 cd forkspoon
 
-# Install Go if needed
-./scripts/install_go.sh
-source ~/.bashrc
-
-# Build
+# Build with make
 make build
 
-# Install system-wide (optional)
-sudo make install
+# Or build directly
+go build -o forkspoon ./cmd/forkspoon
 ```
 
-### Method 2: Pre-built Binary
+## Basic Usage
+
+### Standard NFS Cache Setup
+
 ```bash
-# Download latest release
-wget https://github.com/yourusername/forkspoon/releases/latest/download/forkspoon-linux-amd64.tar.gz
+# Verify NFS is mounted
+mount | grep nfs
 
-# Extract
-tar -xzf forkspoon-linux-amd64.tar.gz
+# Create cache mount point
+sudo mkdir -p /mnt/nfs-cached
 
-# Make executable
-chmod +x forkspoon
+# Mount with caching (5-minute TTL)
+sudo ./forkspoon \
+  -backend /mnt/nfs \
+  -mountpoint /mnt/nfs-cached \
+  -cache-ttl 5m
 
-# Move to PATH (optional)
-sudo mv forkspoon /usr/local/bin/
+# Use the cached mount
+ls -la /mnt/nfs-cached
 ```
-
-### Method 3: Docker Container
-```bash
-# Build container
-docker build -t forkspoon .
-
-# Run with privileges for FUSE
-docker run --privileged \
-  -v /mnt/backend:/backend \
-  -v /mnt/cache:/cache \
-  forkspoon
-```
-
----
-
-## Configuration
 
 ### Command-Line Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `-backend` | (required) | Path to backend directory |
-| `-mountpoint` | (required) | Where to mount cached filesystem |
-| `-cache-ttl` | 5m | Cache timeout (e.g., 30s, 5m, 1h) |
-| `-allow-other` | false | Allow other users to access mount |
-| `-verbose` | false | Enable verbose logging |
-| `-debug` | false | Enable FUSE debug output |
-| `-trans-log` | (none) | Transaction log file path |
-| `-stats-file` | (none) | Statistics output file (JSON) |
-
-### Configuration File (optional)
-Create `~/.forkspoon.yaml`:
-
-```yaml
-# Default configuration
-cache_ttl: 5m
-verbose: false
-allow_other: false
-
-# Logging
-transaction_log: /var/log/cache-fuse/transactions.log
-stats_file: /var/log/cache-fuse/stats.json
-
-# Performance
-max_background: 128
-max_write: 1048576  # 1MB
-max_readahead: 1048576  # 1MB
-
-# Mount profiles
-profiles:
-  nfs:
-    cache_ttl: 10m
-    verbose: true
-
-  dev:
-    cache_ttl: 30s
-    debug: true
-```
-
-### Environment Variables
-```bash
-export CACHE_FUSE_TTL="10m"
-export CACHE_FUSE_VERBOSE="true"
-export CACHE_FUSE_LOG_DIR="/var/log/cache-fuse"
-```
-
----
+| `-backend` | required | Path to NFS mount |
+| `-mountpoint` | required | Cache mount location |
+| `-cache-ttl` | 5m | Cache duration (30s, 5m, 1h) |
+| `-verbose` | false | Enable detailed logging |
+| `-debug` | false | FUSE debug output |
+| `-trans-log` | none | Transaction log path |
+| `-stats-file` | none | JSON statistics file |
+| `-allow-other` | false | Allow other users access |
 
 ## Testing
 
-### 1. Basic Functionality Test
+### Functional Test
 ```bash
-# Run automated test suite
-make test
-
-# Or manually
-./scripts/test_basic.sh
-```
-
-### 2. Write Operations Test
-```bash
-# Test all write operations
-./scripts/test_writes.sh
-
-# What it tests:
-# - File creation
-# - Content modification
-# - File deletion
-# - Directory operations
-# - Rename operations
-```
-
-### 3. Cache Behavior Test
-```bash
-# Verify caching is working
+# Test basic operations
 ./scripts/test_cache.sh
-
-# This will:
-# 1. Mount with 5-second TTL
-# 2. Access files (cache miss)
-# 3. Re-access immediately (cache hit)
-# 4. Wait for expiry
-# 5. Access again (cache miss)
 ```
 
-### 4. Performance Benchmark
+### Performance Benchmark
 ```bash
-# Run performance comparison
+# Compare cached vs direct access
 ./scripts/benchmark.sh
-
-# Compares:
-# - Direct backend access
-# - Cached access
-# - Shows speedup factor
 ```
 
-### 5. Stress Test
+### Manual Testing
 ```bash
-# High-load testing
-./scripts/stress_test.sh \
-  -files 10000 \
-  -threads 50 \
-  -duration 60s
-```
+# Terminal 1: Mount with verbose logging
+./forkspoon -backend /mnt/nfs -mountpoint /mnt/cached -verbose
 
----
+# Terminal 2: Test caching
+ls -la /mnt/cached  # First access - cache miss
+ls -la /mnt/cached  # Second access - cache hit (no logs)
+
+# Wait for TTL to expire
+sleep 300  # 5 minutes
+ls -la /mnt/cached  # Cache miss again
+```
 
 ## Performance Tuning
 
-### Cache TTL Selection
+### Cache TTL Guidelines for NFS
 
-| Use Case | Recommended TTL | Rationale |
-|----------|-----------------|-----------|
-| Development | 30s-1m | Quick feedback on changes |
-| Read-heavy workloads | 5-10m | Maximum performance |
-| Build systems | 1-5m | Balance freshness/speed |
-| Home directories | 1-2m | User file changes |
-| Archive/Backup | 30m-1h | Rarely changes |
+| Workload | Recommended TTL | Notes |
+|----------|-----------------|--------|
+| Development | 30s-1m | Frequent changes |
+| Build systems | 2-5m | Balance performance/freshness |
+| Read-heavy | 5-10m | Maximum performance |
+| Static content | 10-30m | Rarely changes |
 
-### Kernel Parameters
+### Monitoring Cache Effectiveness
+
 ```bash
-# Increase inode cache
-echo 50 | sudo tee /proc/sys/vm/vfs_cache_pressure
-
-# Increase directory entry cache
-echo 100000 | sudo tee /proc/sys/fs/dentry-state
-
-# Monitor cache usage
-cat /proc/meminfo | grep -E "Cached|Slab"
-```
-
-### Mount Options for Different Backends
-
-#### NFS Backend
-```bash
+# Enable transaction logging
 ./forkspoon \
   -backend /mnt/nfs \
-  -mountpoint /mnt/cached-nfs \
-  -cache-ttl 10m \
-  -allow-other
+  -mountpoint /mnt/cached \
+  -trans-log /var/log/forkspoon.log \
+  -stats-file /var/log/forkspoon-stats.json
+
+# Monitor cache misses
+tail -f /var/log/forkspoon.log | grep CACHE_MISS
+
+# Check statistics
+cat /var/log/forkspoon-stats.json | jq '.cached_operations'
 ```
-
-#### S3FS/Cloud Storage Backend
-```bash
-./forkspoon \
-  -backend /mnt/s3fs \
-  -mountpoint /mnt/cached-s3 \
-  -cache-ttl 30m  # Higher TTL for slow backends
-```
-
-#### Local SSD Cache of HDD
-```bash
-./forkspoon \
-  -backend /mnt/hdd-storage \
-  -mountpoint /mnt/ssd-cache \
-  -cache-ttl 1m
-```
-
----
-
-## Monitoring
-
-### Real-time Monitoring
-```bash
-# Watch transaction log
-tail -f /var/log/cache-fuse/transactions.log
-
-# Monitor cache misses only
-tail -f /var/log/cache-fuse/transactions.log | grep CACHE_MISS
-
-# Count operations per second
-watch -n 1 'tail -1000 /var/log/cache-fuse/transactions.log | grep "$(date +%H:%M)" | wc -l'
-```
-
-### Statistics Analysis
-```bash
-# Parse JSON statistics
-cat /var/log/cache-fuse/stats.json | jq '.'
-
-# Get cache hit rate
-cat /var/log/cache-fuse/stats.json | jq '.cached_operations.getattr.hit_rate'
-
-# Operations summary
-cat /var/log/cache-fuse/stats.json | jq '.passthrough_operations'
-```
-
-### Grafana Dashboard
-```yaml
-# prometheus.yml
-scrape_configs:
-  - job_name: 'cache-fuse'
-    scrape_interval: 5s
-    static_configs:
-      - targets: ['localhost:9090']
-```
-
-### Health Checks
-```bash
-# Check if mounted
-mountpoint -q /mnt/cache && echo "OK" || echo "NOT MOUNTED"
-
-# Check cache effectiveness
-./scripts/check_cache_health.sh
-
-# Monitor memory usage
-ps aux | grep forkspoon
-```
-
----
 
 ## Troubleshooting
 
-### Common Issues
+### Mount Issues
 
-#### 1. Mount Permission Denied
+Permission denied:
 ```bash
-# Solution: Add user_allow_other to fuse.conf
+# Add to /etc/fuse.conf
 echo "user_allow_other" | sudo tee -a /etc/fuse.conf
-
-# Or run without -allow-other flag
-./forkspoon -backend /src -mountpoint /dst
 ```
 
-#### 2. Transport endpoint is not connected
+Transport endpoint not connected:
 ```bash
-# Force unmount and remount
-fusermount -uz /mnt/cache
-# or
-sudo umount -l /mnt/cache
-
+fusermount -u /mnt/cached
 # Then remount
 ```
 
-#### 3. Poor Cache Performance
-```bash
-# Check cache TTL is appropriate
-# Increase TTL for better performance
-./forkspoon ... -cache-ttl 10m
+### Performance Issues
 
-# Verify kernel cache pressure
-cat /proc/sys/vm/vfs_cache_pressure  # Lower is better (10-50)
-```
+Cache not effective:
+- Check cache TTL is appropriate for workload
+- Verify with verbose logging that cache is being used
+- Ensure NFS mount itself is working properly
 
-#### 4. High Memory Usage
-```bash
-# Reduce cache TTL
-./forkspoon ... -cache-ttl 1m
+High memory usage:
+- Reduce cache TTL
+- Monitor with: `ps aux | grep forkspoon`
 
-# Clear kernel caches if needed
-sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
-```
+## Architecture Details
 
-#### 5. Stale Data Issues
-```bash
-# Reduce cache TTL for fresher data
-./forkspoon ... -cache-ttl 30s
+### What Gets Cached
 
-# Or manually clear cache
-fusermount -u /mnt/cache && mount_again
-```
+Cached operations (served by kernel VFS after first access):
+- `stat()` - File attributes
+- `lookup()` - Directory entry resolution
+- `readdir()` - Directory listings
 
-### Debug Mode
-```bash
-# Enable all debugging
-./forkspoon \
-  -backend /src \
-  -mountpoint /dst \
-  -verbose \
-  -debug \
-  -trans-log debug.log
+Passthrough operations (never cached):
+- `read()` / `write()` - File contents
+- `create()` / `unlink()` - File creation/deletion
+- `mkdir()` / `rmdir()` - Directory operations
+- `rename()` - File moves
 
-# Analyze debug output
-grep ERROR debug.log
-grep -C3 "permission denied" debug.log
-```
+### Cache Behavior
 
-### Log Analysis
-```bash
-# Find slowest operations
-awk -F'|' '{print $2, $4}' transactions.log | sort | uniq -c | sort -rn
+1. First access to file/directory triggers cache miss
+2. Metadata is cached in kernel VFS for TTL duration
+3. Subsequent accesses served from kernel cache (no FUSE calls)
+4. After TTL expires, next access refreshes cache
 
-# Cache miss patterns
-grep CACHE_MISS transactions.log | awk -F'|' '{print $4}' | sort | uniq -c
+## Limitations
 
-# Error patterns
-grep -E "ERROR|FAIL|errno" debug.log
-```
+- Proof-of-concept implementation
+- No cache invalidation beyond TTL expiry
+- Changes to NFS mount directly won't be visible until cache expires
+- Cache is volatile (lost on unmount)
 
----
+## systemd Service (Optional)
 
-## Production Deployment
-
-### systemd Service
 Create `/etc/systemd/system/forkspoon.service`:
 
 ```ini
 [Unit]
-Description=Metadata-Caching FUSE Filesystem
-After=network.target
-Wants=network-online.target
+Description=Forkspoon NFS Cache
+After=network.target remote-fs.target
 
 [Service]
 Type=forking
-User=root
 ExecStart=/usr/local/bin/forkspoon \
-  -backend /mnt/slow-storage \
-  -mountpoint /mnt/fast-cache \
+  -backend /mnt/nfs \
+  -mountpoint /mnt/nfs-cached \
   -cache-ttl 5m \
-  -trans-log /var/log/cache-fuse/transactions.log \
-  -stats-file /var/log/cache-fuse/stats.json
+  -trans-log /var/log/forkspoon.log
 
-ExecStop=/usr/bin/fusermount -u /mnt/fast-cache
+ExecStop=/usr/bin/fusermount -u /mnt/nfs-cached
 Restart=on-failure
-RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
@@ -452,66 +211,6 @@ WantedBy=multi-user.target
 
 Enable and start:
 ```bash
-sudo systemctl daemon-reload
 sudo systemctl enable forkspoon
 sudo systemctl start forkspoon
 ```
-
-### Auto-mount with fstab
-Add to `/etc/fstab`:
-```
-forkspoon#/mnt/backend /mnt/cache fuse.forkspoon defaults,cache-ttl=5m,allow_other 0 0
-```
-
-### Monitoring with cron
-```bash
-# Add to crontab
-*/5 * * * * /usr/local/bin/check_cache_health.sh
-
-# Health check script
-#!/bin/bash
-if ! mountpoint -q /mnt/cache; then
-    systemctl restart forkspoon
-    echo "Cache FS restarted at $(date)" | mail -s "Cache FS Alert" admin@example.com
-fi
-```
-
----
-
-## Performance Expectations
-
-### Typical Speedup Factors
-
-| Backend Type | Metadata Speedup | Notes |
-|--------------|------------------|--------|
-| NFS v3 | 5-10x | High latency operations |
-| NFS v4 | 3-7x | Better native caching |
-| S3FS | 10-50x | Very high latency |
-| SSHFS | 5-15x | Network dependent |
-| Local HDD | 1.5-3x | Seek time reduction |
-
-### Resource Usage
-
-| Cache TTL | Memory Usage (per 1M files) | CPU Usage |
-|-----------|------------------------------|-----------|
-| 1 minute | ~100MB | Low |
-| 5 minutes | ~500MB | Very Low |
-| 30 minutes | ~1GB | Minimal |
-
----
-
-## Next Steps
-
-1. **Test in Development**: Start with short cache TTL (30s)
-2. **Monitor Performance**: Use transaction logs to understand access patterns
-3. **Tune Cache TTL**: Adjust based on your workload
-4. **Deploy to Production**: Use systemd service for reliability
-5. **Set up Monitoring**: Configure alerts for mount status
-
----
-
-## Support
-
-- GitHub Issues: https://github.com/yourusername/forkspoon/issues
-- Documentation: https://github.com/yourusername/forkspoon/wiki
-- Performance Tuning Guide: [TUNING.md](docs/TUNING.md)
