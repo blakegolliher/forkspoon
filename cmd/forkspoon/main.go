@@ -19,7 +19,7 @@ import (
 
 const (
 	// Default cache metadata TTL
-	DEFAULT_CACHE_TTL = 5 * time.Minute
+	DEFAULT_CACHE_TTL = 30 * time.Second // Changed to 30s for easier testing
 )
 
 // CacheMetrics tracks cache hit/miss statistics
@@ -45,6 +45,43 @@ type CacheMetrics struct {
 	startTime time.Time
 }
 
+// DirCacheEntry holds cached directory entries
+type DirCacheEntry struct {
+	entries []fuse.DirEntry
+	expiry  time.Time
+}
+
+// DirCache is our in-memory directory cache
+type DirCache struct {
+	mu      sync.RWMutex
+	entries map[string]*DirCacheEntry
+}
+
+// LookupCacheEntry holds cached lookup results
+type LookupCacheEntry struct {
+	inode  *fs.Inode
+	entry  fuse.EntryOut
+	expiry time.Time
+}
+
+// LookupCache caches LOOKUP operations
+type LookupCache struct {
+	mu      sync.RWMutex
+	entries map[string]*LookupCacheEntry
+}
+
+// AttrCacheEntry holds cached getattr results
+type AttrCacheEntry struct {
+	attr   fuse.AttrOut
+	expiry time.Time
+}
+
+// AttrCache caches GETATTR operations
+type AttrCache struct {
+	mu      sync.RWMutex
+	entries map[string]*AttrCacheEntry
+}
+
 // Global configuration and metrics
 var (
 	cacheTTL     time.Duration
@@ -52,26 +89,147 @@ var (
 	metrics      = &CacheMetrics{startTime: time.Now()}
 	transLog     *os.File
 	transLogMu   sync.Mutex
+	cacheLog     *RotatingLogger
+	dirCache     = &DirCache{entries: make(map[string]*DirCacheEntry)}
+	lookupCache  = &LookupCache{entries: make(map[string]*LookupCacheEntry)}
+	attrCache    = &AttrCache{entries: make(map[string]*AttrCacheEntry)}
 )
+
+// Get retrieves cached directory entries if not expired
+func (dc *DirCache) Get(path string) ([]fuse.DirEntry, bool) {
+	dc.mu.RLock()
+	defer dc.mu.RUnlock()
+
+	entry, exists := dc.entries[path]
+	if !exists {
+		return nil, false
+	}
+
+	if time.Now().After(entry.expiry) {
+		// Expired, remove it
+		go dc.Remove(path)
+		return nil, false
+	}
+
+	return entry.entries, true
+}
+
+// Put stores directory entries in cache
+func (dc *DirCache) Put(path string, entries []fuse.DirEntry, ttl time.Duration) {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	dc.entries[path] = &DirCacheEntry{
+		entries: entries,
+		expiry:  time.Now().Add(ttl),
+	}
+}
+
+// Remove deletes a cache entry
+func (dc *DirCache) Remove(path string) {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	delete(dc.entries, path)
+}
+
+// Get retrieves cached lookup result
+func (lc *LookupCache) Get(key string) (*LookupCacheEntry, bool) {
+	lc.mu.RLock()
+	defer lc.mu.RUnlock()
+
+	entry, exists := lc.entries[key]
+	if !exists {
+		return nil, false
+	}
+
+	if time.Now().After(entry.expiry) {
+		go lc.Remove(key)
+		return nil, false
+	}
+
+	return entry, true
+}
+
+// Put stores lookup result in cache
+func (lc *LookupCache) Put(key string, inode *fs.Inode, entry fuse.EntryOut, ttl time.Duration) {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+
+	lc.entries[key] = &LookupCacheEntry{
+		inode:  inode,
+		entry:  entry,
+		expiry: time.Now().Add(ttl),
+	}
+}
+
+// Remove deletes a lookup cache entry
+func (lc *LookupCache) Remove(key string) {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	delete(lc.entries, key)
+}
+
+// Get retrieves cached attr result
+func (ac *AttrCache) Get(path string) (*fuse.AttrOut, bool) {
+	ac.mu.RLock()
+	defer ac.mu.RUnlock()
+
+	entry, exists := ac.entries[path]
+	if !exists {
+		return nil, false
+	}
+
+	if time.Now().After(entry.expiry) {
+		go ac.Remove(path)
+		return nil, false
+	}
+
+	return &entry.attr, true
+}
+
+// Put stores attr result in cache
+func (ac *AttrCache) Put(path string, attr fuse.AttrOut, ttl time.Duration) {
+	ac.mu.Lock()
+	defer ac.mu.Unlock()
+
+	ac.entries[path] = &AttrCacheEntry{
+		attr:   attr,
+		expiry: time.Now().Add(ttl),
+	}
+}
+
+// Remove deletes an attr cache entry
+func (ac *AttrCache) Remove(path string) {
+	ac.mu.Lock()
+	defer ac.mu.Unlock()
+	delete(ac.entries, path)
+}
 
 // logTransaction logs cache hits/misses and passthrough operations
 func logTransaction(op string, path string, cached bool) {
-	if transLog == nil {
-		return
-	}
-
-	transLogMu.Lock()
-	defer transLogMu.Unlock()
-
 	timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+
+	// Determine cache status
 	cacheStatus := "PASSTHROUGH"
-	if cached {
-		cacheStatus = "CACHE_HIT"
-	} else if op == "GETATTR" || op == "LOOKUP" || op == "READDIR" {
-		cacheStatus = "CACHE_MISS"
+	if op == "GETATTR" || op == "LOOKUP" || op == "READDIR" {
+		if cached {
+			cacheStatus = "CACHE_HIT"
+		} else {
+			cacheStatus = "CACHE_MISS"
+		}
 	}
 
-	fmt.Fprintf(transLog, "%s | %-10s | %-12s | %s\n", timestamp, op, cacheStatus, path)
+	// Log to rotating cache log
+	if cacheLog != nil && (op == "GETATTR" || op == "LOOKUP" || op == "READDIR") {
+		cacheLog.Write("%s | %-10s | %-12s | %s", timestamp, op, cacheStatus, path)
+	}
+
+	// Log everything to transaction log if enabled
+	if transLog != nil {
+		transLogMu.Lock()
+		defer transLogMu.Unlock()
+		fmt.Fprintf(transLog, "%s | %-10s | %-12s | %s\n", timestamp, op, cacheStatus, path)
+	}
 }
 
 // updateMetrics updates the cache metrics
@@ -232,16 +390,30 @@ func (n *loopbackNode) path() string {
 
 // ============ METADATA OPERATIONS (CACHED) ============
 
-// Getattr for loopbackNode - CACHED
+// Getattr for loopbackNode - NOW WITH CACHING!
 func (n *loopbackNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	p := n.path()
 
-	// This is always a cache miss when called (kernel cache expired)
+	// Check cache first
+	if cached, hit := attrCache.Get(p); hit {
+		// Cache HIT!
+		updateMetrics("GETATTR", true)
+		logTransaction("GETATTR", p, true)
+
+		if verbose {
+			log.Printf("[GETATTR] CACHE HIT for: %s", p)
+		}
+
+		*out = *cached
+		return 0
+	}
+
+	// Cache MISS - do actual getattr
 	updateMetrics("GETATTR", false)
 	logTransaction("GETATTR", p, false)
 
 	if verbose {
-		log.Printf("[GETATTR] Cache miss for: %s", p)
+		log.Printf("[GETATTR] CACHE MISS for: %s", p)
 	}
 
 	var st syscall.Stat_t
@@ -253,20 +425,39 @@ func (n *loopbackNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.A
 
 	// Set cache timeout - this enables kernel caching
 	out.SetTimeout(cacheTTL)
+
+	// Store in our cache
+	attrCache.Put(p, *out, cacheTTL)
+
 	if verbose {
-		log.Printf("[GETATTR] Setting cache TTL to %v for: %s", cacheTTL, p)
+		log.Printf("[GETATTR] Cached attributes for: %s (TTL: %v)", p, cacheTTL)
 	}
 
 	return 0
 }
 
-// Getattr for rootNode - CACHED
+// Getattr for rootNode - NOW WITH CACHING!
 func (r *rootNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	// Check cache first
+	if cached, hit := attrCache.Get(r.rootPath); hit {
+		// Cache HIT!
+		updateMetrics("GETATTR", true)
+		logTransaction("GETATTR", r.rootPath, true)
+
+		if verbose {
+			log.Printf("[GETATTR] CACHE HIT for root: %s", r.rootPath)
+		}
+
+		*out = *cached
+		return 0
+	}
+
+	// Cache MISS - do actual getattr
 	updateMetrics("GETATTR", false)
 	logTransaction("GETATTR", r.rootPath, false)
 
 	if verbose {
-		log.Printf("[GETATTR] Cache miss for root: %s", r.rootPath)
+		log.Printf("[GETATTR] CACHE MISS for root: %s", r.rootPath)
 	}
 
 	var st syscall.Stat_t
@@ -277,22 +468,43 @@ func (r *rootNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrO
 	out.FromStat(&st)
 
 	out.SetTimeout(cacheTTL)
+
+	// Store in our cache
+	attrCache.Put(r.rootPath, *out, cacheTTL)
+
 	if verbose {
-		log.Printf("[GETATTR] Setting cache TTL to %v for root", cacheTTL)
+		log.Printf("[GETATTR] Cached attributes for root (TTL: %v)", cacheTTL)
 	}
 
 	return 0
 }
 
-// Lookup for rootNode - CACHED
+// Lookup for rootNode - NOW WITH CACHING!
 func (r *rootNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	p := filepath.Join(r.rootPath, name)
+	cacheKey := p
 
+	// Check cache first
+	if cached, hit := lookupCache.Get(cacheKey); hit {
+		// Cache HIT!
+		updateMetrics("LOOKUP", true)
+		logTransaction("LOOKUP", name, true)
+
+		if verbose {
+			log.Printf("[LOOKUP] CACHE HIT for: %s", name)
+		}
+
+		// Use cached attributes
+		*out = cached.entry
+		return cached.inode, 0
+	}
+
+	// Cache MISS - do actual lookup
 	updateMetrics("LOOKUP", false)
 	logTransaction("LOOKUP", name, false)
 
 	if verbose {
-		log.Printf("[LOOKUP] Cache miss for: %s", name)
+		log.Printf("[LOOKUP] CACHE MISS for: %s", name)
 	}
 
 	var st syscall.Stat_t
@@ -308,22 +520,44 @@ func (r *rootNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 	out.SetAttrTimeout(cacheTTL)
 
 	if verbose {
-		log.Printf("[LOOKUP] Setting cache TTL to %v for: %s", cacheTTL, name)
+		log.Printf("[LOOKUP] Caching entry for: %s (TTL: %v)", name, cacheTTL)
 	}
 
 	node := &loopbackNode{}
-	return r.NewInode(ctx, node, fs.StableAttr{Mode: st.Mode, Ino: st.Ino}), 0
+	inode := r.NewInode(ctx, node, fs.StableAttr{Mode: st.Mode, Ino: st.Ino})
+
+	// Store in cache
+	lookupCache.Put(cacheKey, inode, *out, cacheTTL)
+
+	return inode, 0
 }
 
-// Lookup for loopbackNode - CACHED
+// Lookup for loopbackNode - NOW WITH CACHING!
 func (n *loopbackNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	p := filepath.Join(n.path(), name)
+	cacheKey := p
 
+	// Check cache first
+	if cached, hit := lookupCache.Get(cacheKey); hit {
+		// Cache HIT!
+		updateMetrics("LOOKUP", true)
+		logTransaction("LOOKUP", p, true)
+
+		if verbose {
+			log.Printf("[LOOKUP] CACHE HIT for: %s/%s", n.path(), name)
+		}
+
+		// Use cached attributes
+		*out = cached.entry
+		return cached.inode, 0
+	}
+
+	// Cache MISS - do actual lookup
 	updateMetrics("LOOKUP", false)
 	logTransaction("LOOKUP", p, false)
 
 	if verbose {
-		log.Printf("[LOOKUP] Cache miss for: %s/%s", n.path(), name)
+		log.Printf("[LOOKUP] CACHE MISS for: %s/%s", n.path(), name)
 	}
 
 	var st syscall.Stat_t
@@ -337,23 +571,98 @@ func (n *loopbackNode) Lookup(ctx context.Context, name string, out *fuse.EntryO
 	out.SetAttrTimeout(cacheTTL)
 
 	if verbose {
-		log.Printf("[LOOKUP] Setting cache TTL to %v for: %s", cacheTTL, name)
+		log.Printf("[LOOKUP] Caching entry for: %s (TTL: %v)", name, cacheTTL)
 	}
 
 	node := &loopbackNode{}
-	return n.NewInode(ctx, node, fs.StableAttr{Mode: st.Mode, Ino: st.Ino}), 0
+	inode := n.NewInode(ctx, node, fs.StableAttr{Mode: st.Mode, Ino: st.Ino})
+
+	// Store in cache
+	lookupCache.Put(cacheKey, inode, *out, cacheTTL)
+
+	return inode, 0
 }
 
-// Readdir - CACHED through Getattr
-func (n *loopbackNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	updateMetrics("READDIR", false)
-	logTransaction("READDIR", n.path(), false)
+// CachedDirStream wraps directory entries for caching
+type CachedDirStream struct {
+	entries []fuse.DirEntry
+	index   int
+}
 
-	if verbose {
-		log.Printf("[READDIR] Directory: %s", n.path())
+func (s *CachedDirStream) HasNext() bool {
+	return s.index < len(s.entries)
+}
+
+func (s *CachedDirStream) Next() (fuse.DirEntry, syscall.Errno) {
+	if !s.HasNext() {
+		return fuse.DirEntry{}, syscall.ENOENT
+	}
+	entry := s.entries[s.index]
+	s.index++
+	return entry, 0
+}
+
+func (s *CachedDirStream) Close() {}
+
+// Readdir - NOW WITH ACTUAL CACHING!
+func (n *loopbackNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	dirPath := n.path()
+
+	// Check cache first
+	if cachedEntries, hit := dirCache.Get(dirPath); hit {
+		// Cache HIT!
+		updateMetrics("READDIR", true)
+		logTransaction("READDIR", dirPath, true)
+
+		if verbose {
+			log.Printf("[READDIR] CACHE HIT for: %s", dirPath)
+		}
+
+		// Return cached entries
+		return &CachedDirStream{entries: cachedEntries}, 0
 	}
 
-	return fs.NewLoopbackDirStream(n.path())
+	// Cache MISS - read from filesystem
+	updateMetrics("READDIR", false)
+	logTransaction("READDIR", dirPath, false)
+
+	if verbose {
+		log.Printf("[READDIR] CACHE MISS for: %s", dirPath)
+	}
+
+	// Read directory entries
+	f, err := os.Open(dirPath)
+	if err != nil {
+		return nil, fs.ToErrno(err)
+	}
+	defer f.Close()
+
+	entries, err := f.Readdir(-1)
+	if err != nil {
+		return nil, fs.ToErrno(err)
+	}
+
+	// Convert to fuse.DirEntry and cache
+	fuseEntries := make([]fuse.DirEntry, 0, len(entries))
+	for _, e := range entries {
+		var stat syscall.Stat_t
+		if err := syscall.Lstat(filepath.Join(dirPath, e.Name()), &stat); err == nil {
+			fuseEntries = append(fuseEntries, fuse.DirEntry{
+				Name: e.Name(),
+				Mode: uint32(stat.Mode),
+				Ino:  stat.Ino,
+			})
+		}
+	}
+
+	// Store in cache
+	dirCache.Put(dirPath, fuseEntries, cacheTTL)
+
+	if verbose {
+		log.Printf("[READDIR] Cached %d entries for: %s (TTL: %v)", len(fuseEntries), dirPath, cacheTTL)
+	}
+
+	return &CachedDirStream{entries: fuseEntries}, 0
 }
 
 // ============ DATA OPERATIONS (PASSTHROUGH - NEVER CACHED) ============
@@ -682,6 +991,27 @@ func main() {
 		log.Fatalf("Failed to create mountpoint: %v", err)
 	}
 
+	// Initialize rotating cache log
+	// Use home directory if /opt/forkspoon is not writable
+	logPath := "/opt/forkspoon/forkspoon.log"
+	if _, err := os.Stat("/opt/forkspoon"); os.IsNotExist(err) {
+		// Try to create the directory
+		if err := os.MkdirAll("/opt/forkspoon", 0755); err != nil {
+			// Fall back to home directory
+			homeDir, _ := os.UserHomeDir()
+			logPath = filepath.Join(homeDir, "forkspoon.log")
+			log.Printf("Using fallback log location: %s", logPath)
+		}
+	}
+	cacheLog, err = NewRotatingLogger(logPath)
+	if err != nil {
+		log.Printf("Warning: Failed to create rotating cache log: %v", err)
+		// Continue without rotating log
+	} else {
+		defer cacheLog.Close()
+		cacheLog.WriteHeader(*backendPtr, *mountpointPtr, cacheTTL)
+	}
+
 	// Open transaction log if requested
 	if *transLogPtr != "" {
 		var err error
@@ -707,16 +1037,17 @@ func main() {
 		rootPath: *backendPtr,
 	}
 
-	// Mount options
-	zeroTimeout := time.Duration(0)
+	// Mount options - CRITICAL: Set non-zero defaults to enable caching
 	opts := &fs.Options{
-		AttrTimeout:     &zeroTimeout,
-		EntryTimeout:    &zeroTimeout,
-		NegativeTimeout: cacheTTLPtr,
+		// These are the DEFAULT timeouts. Individual operations can override them.
+		// Setting these to non-zero enables kernel caching!
+		AttrTimeout:     &cacheTTL,
+		EntryTimeout:    &cacheTTL,
+		NegativeTimeout: &cacheTTL,
 
 		MountOptions: fuse.MountOptions{
 			AllowOther: *allowOtherPtr,
-			FsName:     "my-cache-fs",
+			FsName:     "forkspoon-cache",
 			Debug:      *debugPtr,
 		},
 	}
@@ -742,23 +1073,42 @@ func main() {
 	}()
 
 	log.Println("==========================================")
-	log.Println("Caching FUSE Filesystem Mounted")
+	log.Println("Forkspoon Caching FUSE Filesystem v2.0")
+	log.Printf("Built: %s", time.Now().Format("2006-01-02 15:04:05"))
 	log.Println("==========================================")
 	log.Printf("Backend:     %s", *backendPtr)
 	log.Printf("Mount:       %s", *mountpointPtr)
 	log.Printf("Cache TTL:   %v", cacheTTL)
+	log.Printf("Cache Log:   %s", logPath)
 	if *transLogPtr != "" {
 		log.Printf("Trans Log:   %s", *transLogPtr)
 	}
 	log.Println("==========================================")
-	log.Println("What's Being Cached:")
-	log.Println("  • File/Directory attributes (stat)")
-	log.Println("  • Directory entry lookups")
-	log.Println("  • Directory listings")
-	log.Println("What's NOT Cached (passthrough):")
-	log.Println("  • File contents (read/write)")
-	log.Println("  • File modifications")
+	log.Println("Caching Strategy:")
+	log.Println("  • LOOKUP: In-memory cache (fixes wildcard issue!)")
+	log.Println("  • GETATTR: In-memory cache")
+	log.Println("  • READDIR: In-memory cache")
+	log.Println("  • All cache hits/misses are logged!")
 	log.Println("==========================================")
+
+	// Start metrics reporter
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			totalHits := metrics.GetattrHits + metrics.LookupHits + metrics.ReaddirHits
+			totalMisses := metrics.GetattrMisses + metrics.LookupMisses + metrics.ReaddirMisses
+			total := totalHits + totalMisses
+
+			if total > 0 {
+				hitRate := float64(totalHits) * 100 / float64(total)
+				log.Printf("Cache Stats: %d ops (%.1f%% hit rate) | Hits: %d | Misses: %d | READDIR H:%d/M:%d",
+					total, hitRate, totalHits, totalMisses,
+					metrics.ReaddirHits, metrics.ReaddirMisses)
+			}
+		}
+	}()
+
 	log.Println("Press Ctrl+C to unmount and see statistics")
 
 	// Wait for unmount
