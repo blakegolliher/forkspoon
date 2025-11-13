@@ -1,0 +1,48 @@
+# Systemd service file for Forkspoon
+# Copy to /etc/systemd/system/forkspoon.service
+
+[Unit]
+Description=Metadata-Caching FUSE Filesystem for NFS
+After=network.target network-online.target
+Wants=network-online.target
+# Ensure NFS is mounted first if applicable
+After=remote-fs.target
+
+[Service]
+Type=forking
+User=root
+Group=root
+
+# Create required directories
+ExecStartPre=/bin/mkdir -p /var/log/cache-fuse
+ExecStartPre=/bin/mkdir -p /mnt/cache
+
+# Main service
+ExecStart=/usr/local/bin/forkspoon \
+    -backend /mnt/nfs \
+    -mountpoint /mnt/cache \
+    -cache-ttl 5m \
+    -allow-other \
+    -trans-log /var/log/cache-fuse/transactions.log \
+    -stats-file /var/log/cache-fuse/stats.json
+
+# Unmount on stop
+ExecStop=/usr/bin/fusermount -u /mnt/cache
+
+# Restart policy
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=3
+
+# Security
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/mnt /var/log/cache-fuse
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target

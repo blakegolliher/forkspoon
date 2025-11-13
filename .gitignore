@@ -1,0 +1,59 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+cache-fuse-fs
+my-cache-fs
+
+# Build directories
+build/
+dist/
+vendor/
+
+# Test binaries
+*.test
+*.out
+
+# Go workspace
+go.work
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Statistics
+*.json
+stats/
+
+# Test mounts
+/tmp/test-*
+/tmp/fuse-*
+/tmp/demo-*
+
+# Coverage
+*.cov
+coverage.html
+coverage.txt
+
+# Release
+release/
+*.tar.gz
+*.zip
+
+# Local config
+.env
+.env.local
+config.local.yaml
